@@ -670,794 +670,6 @@ function FocusBadge({ elapsed, totalSecs, onClear }) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  Floating Player
-// ══════════════════════════════════════════════════════════
-function FloatingPlayer({
-  video, onClose, onMinimize, minimized,
-  playlist, onNext, onPrev,
-  musicMode, onToggleMusic,
-  onEnded,
-  isFav, onToggleFav,
-  onAddToPlaylist,
-}) {
-  const { pos, size, onDragStart, onResizeStart } = useDragResize(
-    { x: Math.max(10, (window.innerWidth || 800) - 420), y: 70 },
-    { w: 390, h: 250 },
-  );
-
-  const [locked,       setLocked]       = useState(false);
-  const [opacity,      setOpacity]      = useState(100);
-  const [showCtrl,     setShowCtrl]     = useState(false);
-  const [playing,      setPlaying]      = useState(true);
-  const [volume,       setVolume]       = useState(80);
-  const [muted,        setMuted]        = useState(false);
-  const [progress,     setProgress]     = useState(0);
-  const [duration,     setDuration]     = useState(0);
-  const [speed,        setSpeed]        = useState(1);
-  const [sleepSec,     setSleepSec]     = useState(0);
-  const [showSettings, setShowSettings] = useState(false);
-  const [loop,         setLoop]         = useState(false);
-  const [isPiP,        setIsPiP]        = useState(false);
-  const [showHelp,     setShowHelp]     = useState(false);
-  const [toast,        setToast]        = useState("");
-  const [embedError,   setEmbedError]   = useState(null); // null | { code, msg }
-  const [isFullscreen, setIsFullscreen] = useState(false);
-  const [bookmarks,    setBookmarks]    = useState([]);   // {time, label, id}
-  const [showBookmarks,setShowBookmarks]= useState(false);
-  const [bookmarkLabel,setBookmarkLabel]= useState("");
-
-  // ── Focus Mode ──
-  const [focusActive,  setFocusActive]  = useState(false);
-  const [focusTotalSec,setFocusTotalSec]= useState(0);
-  const [focusElapsed, setFocusElapsed] = useState(0);
-  const [showBreak,    setShowBreak]    = useState(false);
-  const focusIntervalRef = useRef(null);
-
-  const startFocus = (mins) => {
-    setFocusActive(true);
-    setFocusTotalSec(mins * 60);
-    setFocusElapsed(0);
-    setShowBreak(false);
-    clearInterval(focusIntervalRef.current);
-    focusIntervalRef.current = setInterval(() => {
-      setFocusElapsed(p => p + 1);
-    }, 1000);
-    setToast(`🧠 Focus Mode: ${mins} min`);
-  };
-
-  const stopFocus = () => {
-    setFocusActive(false);
-    setFocusTotalSec(0);
-    setFocusElapsed(0);
-    setShowBreak(false);
-    clearInterval(focusIntervalRef.current);
-  };
-
-  const snoozeFocus = () => {
-    setFocusTotalSec(5 * 60);   // fresh 5-min countdown
-    setFocusElapsed(0);          // reset elapsed
-    setShowBreak(false);
-    ytRef.current?.playVideo();
-    setToast("⏰ Snoozed +5 min");
-  };
-
-  const resumeFromBreak = () => {
-    setShowBreak(false);
-    ytRef.current?.playVideo();
-  };
-
-  // trigger break when elapsed >= total
-  useEffect(() => {
-    if (focusActive && focusTotalSec > 0 && focusElapsed >= focusTotalSec && !showBreak) {
-      setShowBreak(true);
-      ytRef.current?.pauseVideo();
-      setFocusElapsed(0);
-      setFocusTotalSec(p => p); // keep same interval for repeat
-    }
-  }, [focusElapsed, focusTotalSec, focusActive, showBreak]);
-
-  useEffect(() => () => clearInterval(focusIntervalRef.current), []);
-
-  const volumeRef = useRef(80);
-
-  const playerDivRef = useRef(null);
-  const ytRef        = useRef(null);
-  const intervalRef  = useRef(null);
-  const sleepRef     = useRef(null);
-
-  // ── Playback Resume helpers ──
-  const resumeKey  = `ft_resume_${video.id}`;
-  const saveResume = (t) => { try { localStorage.setItem(resumeKey, String(Math.floor(t))); } catch {} };
-  const loadResume = ()  => { try { const v = localStorage.getItem(resumeKey); return v ? parseInt(v, 10) : 0; } catch { return 0; } };
-  const clearResume= ()  => { try { localStorage.removeItem(resumeKey); } catch {} };
-
-  // ── init / change video ──
-  useEffect(() => {
-    setEmbedError(null);
-    loadYTScript().then((YT) => {
-      if (ytRef.current) { ytRef.current.destroy(); ytRef.current = null; }
-      if (!playerDivRef.current) return;
-      const resumeAt = loadResume();
-      // Detect environment — local file vs hosted
-      const isLocal = window.location.protocol === "file:" || window.location.protocol === "content:";
-      ytRef.current = new YT.Player(playerDivRef.current, {
-        videoId: video.id,
-        playerVars: {
-          autoplay: 1,
-          controls: 0,
-          rel: 0,
-          modestbranding: 1,
-          iv_load_policy: 3,
-          playsinline: 1,
-          enablejsapi: 1,
-          // origin fix — use youtube.com as fallback for local files
-          origin: isLocal ? "https://www.youtube.com" : window.location.origin,
-          widget_referrer: "https://www.youtube.com",
-          ...(resumeAt > 5 ? { start: resumeAt } : {}),
-        },
-        events: {
-          onReady: (e) => {
-            e.target.setVolume(volume);
-            e.target.setPlaybackRate(speed);
-            if (muted) e.target.mute();
-            if (resumeAt > 5) {
-              e.target.seekTo(resumeAt, true);
-              setToast(`↩ Resumed from ${Math.floor(resumeAt/60)}:${String(resumeAt%60).padStart(2,"0")}`);
-            }
-          },
-          onStateChange: (e) => {
-            if (e.data === YT.PlayerState.PLAYING) { setPlaying(true); startTick(); }
-            if (e.data === YT.PlayerState.PAUSED)  { setPlaying(false); stopTick(); }
-            if (e.data === YT.PlayerState.ENDED)   {
-              clearResume();
-              if (loop) { e.target.seekTo(0); e.target.playVideo(); }
-              else onEnded?.();
-            }
-          },
-          onError: (e) => {
-            // Error codes: 2=invalid id, 5=html5 error, 100=not found, 101/150=embed not allowed
-            const msgs = {
-              2: "Invalid video ID",
-              5: "HTML5 player error — try another video",
-              100: "Video not found or private",
-              101: "Video cannot be embedded — open in YouTube",
-              150: "Video cannot be embedded — open in YouTube",
-            };
-            const msg = msgs[e.data] || `Playback error (${e.data})`;
-            setToast(`⚠ ${msg}`);
-            // For embed-not-allowed errors, show fallback UI
-            if (e.data === 101 || e.data === 150 || e.data === 100) {
-              setEmbedError({ code: e.data, msg });
-            }
-            setPlaying(false);
-          },
-        },
-      });
-    });
-    return () => {
-      if (ytRef.current) { ytRef.current.destroy(); ytRef.current = null; }
-      stopTick();
-    };
-  }, [video.id]);
-
-  // Reset bookmarks when video changes
-  useEffect(() => {
-    setBookmarks([]);
-    setBookmarkLabel("");
-    setShowBookmarks(false);
-  }, [video.id]);
-
-  const startTick = () => {
-    clearInterval(intervalRef.current);
-    intervalRef.current = setInterval(() => {
-      if (!ytRef.current?.getCurrentTime) return;
-      const cur = ytRef.current.getCurrentTime() || 0;
-      const dur = ytRef.current.getDuration()    || 0;
-      setProgress(cur);
-      setDuration(dur);
-      // save resume position (don't save if near end — last 10s)
-      if (cur > 5 && dur > 0 && cur < dur - 10) saveResume(cur);
-    }, 400);
-  };
-  const stopTick = () => clearInterval(intervalRef.current);
-
-  // ── Sleep timer ──
-  const startSleep = (mins) => {
-    clearTimeout(sleepRef.current);
-    setSleepSec(mins * 60);
-    sleepRef.current = setTimeout(() => {
-      setSleepSec(0);
-      ytRef.current?.pauseVideo();   // pause first
-      setToast("😴 Sleep timer: paused");
-      setTimeout(() => onClose(), 1800);  // close after brief toast
-    }, mins * 60 * 1000);
-  };
-  const clearSleep = () => { clearTimeout(sleepRef.current); setSleepSec(0); };
-  useEffect(() => () => clearTimeout(sleepRef.current), []);
-
-  const togglePlay  = () => playing ? ytRef.current?.pauseVideo() : ytRef.current?.playVideo();
-  const changeVol   = (v) => { setVolume(v); volumeRef.current = v; ytRef.current?.setVolume(v); };
-  const toggleMute  = () => { const nm = !muted; setMuted(nm); nm ? ytRef.current?.mute() : ytRef.current?.unMute(); };
-  const changeSpeed = (s) => { setSpeed(s); ytRef.current?.setPlaybackRate(s); };
-  const seekTo      = (e) => {
-    if (!duration) return;
-    const r = e.currentTarget.getBoundingClientRect();
-    const pct = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
-    ytRef.current?.seekTo(pct * duration, true);
-  };
-  const skipSec     = (s) => ytRef.current?.seekTo((ytRef.current.getCurrentTime() || 0) + s, true);
-  const fmtTime     = (s) => { s = Math.floor(s || 0); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; };
-
-  // ── Bookmarks ──
-  const addBookmark = useCallback(() => {
-    const t = Math.floor(ytRef.current?.getCurrentTime() || 0);
-    const label = bookmarkLabel.trim() || `${Math.floor(t/60)}:${String(t%60).padStart(2,"0")}`;
-    const bm = { id: Date.now(), time: t, label };
-    setBookmarks(prev => [...prev, bm].sort((a,b) => a.time - b.time));
-    setBookmarkLabel("");
-    setToast(`🔖 Saved: ${label}`);
-  }, [bookmarkLabel]);
-  const removeBookmark = (id) => setBookmarks(prev => prev.filter(b => b.id !== id));
-  const jumpToBookmark = (time) => {
-    ytRef.current?.seekTo(time, true);
-    const label = `${Math.floor(time/60)}:${String(Math.floor(time)%60).padStart(2,"0")}`;
-    setToast(`🔖 ${label}`);
-  };
-
-  // ── Fullscreen ──
-  const toggleFullscreen = async () => {
-    const container = playerDivRef.current?.closest
-      ? playerDivRef.current.closest("[data-floatplayer]")
-      : null;
-    const target = playerDivRef.current?.querySelector("iframe") || container || playerDivRef.current;
-    if (!target) { setToast("⚠ Fullscreen: player not ready"); return; }
-    try {
-      if (!document.fullscreenElement) {
-        await target.requestFullscreen();
-        setIsFullscreen(true);
-        setToast("⛶ Fullscreen");
-      } else {
-        await document.exitFullscreen();
-        setIsFullscreen(false);
-        setToast("⛶ Exited fullscreen");
-      }
-    } catch {
-      setToast("⚠ Fullscreen not supported");
-    }
-  };
-  // sync isFullscreen state with browser ESC key
-  useEffect(() => {
-    const handler = () => setIsFullscreen(!!document.fullscreenElement);
-    document.addEventListener("fullscreenchange", handler);
-    return () => document.removeEventListener("fullscreenchange", handler);
-  }, []);
-
-  // ── Picture-in-Picture ──
-  const togglePiP = async () => {
-    try {
-      const iframe = playerDivRef.current?.querySelector("iframe");
-      if (!iframe) { setToast("⚠ PiP: player not ready"); return; }
-      if (document.pictureInPictureElement) {
-        await document.exitPictureInPicture();
-        setIsPiP(false);
-        setToast("📺 PiP closed");
-      } else {
-        // Create a temporary video element pointing to YT embed
-        const vid = document.createElement("video");
-        vid.src = `https://www.youtube.com/embed/${video.id}?autoplay=1`;
-        vid.style.display = "none";
-        document.body.appendChild(vid);
-        await vid.play().catch(() => {});
-        await vid.requestPictureInPicture().catch(() => {
-          // fallback: open in new small window
-          window.open(
-            `https://www.youtube.com/watch?v=${video.id}`,
-            "pip_window",
-            "width=480,height=300,top=50,right=50"
-          );
-          setToast("↗ Opened in popup window");
-          document.body.removeChild(vid);
-          return;
-        });
-        vid.addEventListener("leavepictureinpicture", () => {
-          document.body.removeChild(vid);
-          setIsPiP(false);
-        });
-        setIsPiP(true);
-        setToast("📺 PiP active");
-      }
-    } catch {
-      // Best fallback: open YouTube in small popup
-      window.open(
-        `https://www.youtube.com/watch?v=${video.id}`,
-        "pip_window",
-        "width=480,height=300"
-      );
-      setToast("↗ Opened in popup window");
-    }
-  };
-
-  // ── Share ──
-  const shareVideo = async () => {
-    const url = `https://youtu.be/${video.id}`;
-    try {
-      if (navigator.share) {
-        await navigator.share({ title: video.title, url });
-        setToast("✅ Shared!");
-      } else {
-        await navigator.clipboard.writeText(url);
-        setToast("🔗 Link copied!");
-      }
-    } catch {
-      setToast("🔗 " + url);
-    }
-  };
-
-  // ── Keyboard shortcuts ──
-  useEffect(() => {
-    const handler = (e) => {
-      const tag = e.target?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
-      switch (e.key) {
-        case " ": case "k": e.preventDefault(); togglePlay(); break;
-        case "ArrowRight":  e.preventDefault(); skipSec(10); setToast("⏩ +10s"); break;
-        case "ArrowLeft":   e.preventDefault(); skipSec(-10); setToast("⏪ -10s"); break;
-        case "ArrowUp":     e.preventDefault(); {
-          const nv = Math.min(100, (volumeRef.current || volume) + 10);
-          volumeRef.current = nv; changeVol(nv); setToast(`🔊 ${nv}%`);
-        } break;
-        case "ArrowDown":   e.preventDefault(); {
-          const nv = Math.max(0, (volumeRef.current || volume) - 10);
-          volumeRef.current = nv; changeVol(nv); setToast(`🔉 ${nv}%`);
-        } break;
-        case "m": case "M": toggleMute(); setToast(muted ? "🔊 Unmuted" : "🔇 Muted"); break;
-        case "l": case "L": setLoop(p => { setToast(p ? "🔁 Loop off" : "🔁 Loop on"); return !p; }); break;
-        case "n": case "N": onNext?.(); setToast("⏭ Next"); break;
-        case "p": case "P": onPrev?.(); setToast("⏮ Prev"); break;
-        case "f": case "F": onToggleFav?.(video); setToast(isFav ? "★ Removed fav" : "★ Added fav"); break;
-        case "i": case "I": togglePiP(); break;
-        case "v": case "V": toggleFullscreen(); break;
-        case "Escape":      onClose?.(); break;
-        case "?":           setShowHelp(h => !h); break;
-        case "b": case "B": addBookmark(); break;
-        default: break;
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
-  }, [playing, muted, volume, loop, isFav, video, addBookmark]);
-
-  // ═══════ MINIMISED BAR ═══════
-  if (minimized) return (
-    <>
-      {toast && <Toast message={toast} onDone={() => setToast("")} />}
-      {showHelp && <ShortcutHelp onClose={() => setShowHelp(false)} />}
-      <div style={{
-      position: "fixed", bottom: 16, right: 16, zIndex: 9999,
-      background: "#0f0f18", border: "1px solid #ff005066",
-      borderRadius: 14, display: "flex", alignItems: "center",
-      gap: 10, padding: "8px 12px",
-      boxShadow: "0 4px 32px #ff005040", userSelect: "none",
-      maxWidth: "calc(100vw - 32px)",
-      opacity: opacity / 100,
-    }}>
-      <img src={video.thumb} onClick={onMinimize}
-        style={{ width: 50, height: 36, borderRadius: 7, objectFit: "cover", cursor: "pointer" }} alt="" />
-      <div style={{ flex: 1, minWidth: 0, cursor: "pointer" }} onClick={onMinimize}>
-        <div style={{ color: "#fff", fontSize: 12, fontWeight: 600,
-          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 180 }}>
-          {video.title}
-        </div>
-        <div style={{ color: "#ff0050", fontSize: 10, marginTop: 2 }}>▶ tap to expand</div>
-      </div>
-      {sleepSec > 0 && <SleepTimerBadge seconds={sleepSec} onClear={clearSleep} />}
-      <button onClick={skipSec.bind(null,-10)} style={btn()} title="⏪ -10s (←)">⏪</button>
-      <button onClick={togglePlay}             style={btn({ color: "#ff0050", fontSize: 18 })}>{playing?"⏸":"▶"}</button>
-      <button onClick={skipSec.bind(null, 10)} style={btn()} title="⏩ +10s (→)">⏩</button>
-      <button onClick={onNext}                 style={btn()}>⏭</button>
-      {/* Speed cycle badge — click to cycle through speeds */}
-      <button
-        onClick={() => {
-          const speeds = [0.5, 0.75, 1, 1.25, 1.5, 2];
-          const next = speeds[(speeds.indexOf(speed) + 1) % speeds.length];
-          changeSpeed(next);
-          setToast(`⚡ ${next}×`);
-        }}
-        title="Cycle playback speed"
-        style={{
-          background: speed !== 1 ? "#ff005033" : "#ffffff0f",
-          border: "1px solid " + (speed !== 1 ? "#ff005066" : "#ffffff11"),
-          borderRadius: 6, padding: "2px 6px",
-          color: speed !== 1 ? "#ff0050" : "#888",
-          cursor: "pointer", fontSize: 10, fontWeight: 700, lineHeight: 1.6,
-        }}>
-        {speed}×
-      </button>
-      <button onClick={shareVideo}             style={btn({ fontSize: 13 })} title="Share">🔗</button>
-      <button onClick={togglePiP}              style={btn({ color: isPiP ? "#ff0050" : "#888", fontSize: 13 })} title="PiP (I)">⧉</button>
-      <button onClick={(e) => { e.stopPropagation(); onClose(); }}
-        style={btn({ color: "#666", fontSize: 18 })}>✕</button>
-    </div>
-    </>
-  );
-
-  // ═══════ FULL PLAYER ═══════
-  return (
-    <>
-      {toast && <Toast message={toast} onDone={() => setToast("")} />}
-      {showHelp && <ShortcutHelp onClose={() => setShowHelp(false)} />}
-      {showBreak && (
-        <BreakReminderOverlay
-          elapsed={focusTotalSec}
-          onSnooze={snoozeFocus}
-          onStop={stopFocus}
-          onResume={resumeFromBreak}
-        />
-      )}
-    <div
-      onMouseDown={locked ? undefined : onDragStart}
-      onTouchStart={locked ? undefined : onDragStart}
-      data-floatplayer="true"
-      style={{
-        position: "fixed", left: pos.x, top: pos.y, zIndex: 9999,
-        width: size.w, height: musicMode ? 110 : size.h,
-        background: "#09090f",
-        opacity: opacity / 100,
-        border: "1.5px solid #ff005055",
-        borderRadius: 14,
-        boxShadow: "0 10px 70px #ff005030, 0 2px 24px #0009",
-        display: "flex", flexDirection: "column",
-        overflow: "hidden", userSelect: "none",
-        transition: "height 0.25s ease",
-      }}
-    >
-      {/* ── Title bar ── */}
-      <div style={{
-        display: "flex", alignItems: "center", gap: 7, padding: "6px 10px",
-        background: "#111118", borderBottom: "1px solid #ffffff0e",
-        cursor: locked ? "not-allowed" : "move", flexShrink: 0,
-      }}>
-        <span style={{ color: "#ff0050", fontSize: 12, flexShrink: 0 }}>▶</span>
-        <span style={{ flex: 1, color: "#ececec", fontSize: 11, fontWeight: 600,
-          whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{video.title}</span>
-
-        {sleepSec > 0 && <SleepTimerBadge seconds={sleepSec} onClear={clearSleep} />}
-        {focusActive && (
-          <FocusBadge elapsed={focusElapsed} totalSecs={focusTotalSec} onClear={stopFocus} />
-        )}
-
-        <button onClick={() => onToggleFav(video)} title="Favourite (F)"
-          style={btn({ color: isFav ? "#ffd700" : "#555", fontSize: 14 })}>★</button>
-        <button onClick={() => onAddToPlaylist(video)} title="Add to playlist"
-          style={btn({ fontSize: 13 })}>＋</button>
-        <button onClick={shareVideo} title="Share / Copy link"
-          style={btn({ fontSize: 13 })}>🔗</button>
-        <button onClick={togglePiP} title="Picture-in-Picture (I)"
-          style={btn({ color: isPiP ? "#ff0050" : "#888", fontSize: 13 })}>⧉</button>
-        <button onClick={toggleFullscreen} title="Fullscreen (V)"
-          style={btn({ color: isFullscreen ? "#ff0050" : "#888", fontSize: 13 })}>⛶</button>
-        <button onClick={() => setLoop(l => !l)} title="Loop (L)"
-          style={btn({ color: loop ? "#ff0050" : "#555" })}>🔁</button>
-        <button onClick={onToggleMusic} title="Music mode"
-          style={btn({ color: musicMode ? "#ff0050" : "#555" })}>🎵</button>
-        <button onClick={() => setShowSettings(s => !s)} title="Settings"
-          style={btn({ color: showSettings ? "#ff0050" : "#888" })}>⚙</button>
-        <button onClick={() => setShowHelp(h => !h)} title="Keyboard shortcuts (?)"
-          style={btn({ color: showHelp ? "#ff0050" : "#555", fontSize: 11 })}>?</button>
-        <button onClick={() => setShowBookmarks(b => !b)} title="Bookmarks (B)"
-          style={btn({ color: showBookmarks ? "#ff0050" : (bookmarks.length > 0 ? "#ffd700" : "#555"), fontSize: 13 })}>
-          🔖{bookmarks.length > 0 ? bookmarks.length : ""}
-        </button>
-        <button onClick={() => setLocked(l => !l)} title="Lock (unlock drag)"
-          style={btn({ color: locked ? "#ff0050" : "#555" })}>🔒</button>
-        <button onClick={onMinimize} style={btn({ fontSize: 16 })}>─</button>
-        <button onClick={onClose}    style={btn({ fontSize: 16 })}>✕</button>
-      </div>
-
-      {/* ── Settings panel ── */}
-      {showSettings && (
-        <div style={{
-          background: "#111118", borderBottom: "1px solid #ffffff0e",
-          padding: "8px 12px", display: "flex", flexWrap: "wrap", gap: 12, flexShrink: 0,
-        }}>
-          {/* Speed */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ color: "#888", fontSize: 11 }}>Speed:</span>
-            {[0.5, 0.75, 1, 1.25, 1.5, 2].map(s => (
-              <button key={s} onClick={() => changeSpeed(s)} style={{
-                background: speed === s ? "#ff0050" : "#ffffff14",
-                border: "none", borderRadius: 5, padding: "2px 7px",
-                color: speed === s ? "#fff" : "#aaa", fontSize: 11, cursor: "pointer",
-              }}>{s}×</button>
-            ))}
-          </div>
-          {/* Sleep */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ color: "#888", fontSize: 11 }}>Sleep:</span>
-            {[15, 30, 60, 90].map(m => (
-              <button key={m} onClick={() => startSleep(m)} style={{
-                background: sleepSec === m*60 ? "#ff0050" : "#ffffff14",
-                border: "none", borderRadius: 5, padding: "2px 7px",
-                color: sleepSec === m*60 ? "#fff" : "#aaa", fontSize: 11, cursor: "pointer",
-              }}>{m}m</button>
-            ))}
-            {sleepSec > 0 && (
-              <button onClick={clearSleep} style={{
-                background: "#ff005033", border: "none", borderRadius: 5, padding: "2px 7px",
-                color: "#ff0050", fontSize: 11, cursor: "pointer",
-              }}>✕ off</button>
-            )}
-          </div>
-          {/* Opacity */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <span style={{ color: "#888", fontSize: 11 }}>💧 Opacity:</span>
-            <input type="range" min={20} max={100} value={opacity}
-              onChange={e => setOpacity(+e.target.value)}
-              style={{ width: 72, accentColor: "#ff0050", cursor: "pointer" }} />
-            <span style={{ color: opacity < 100 ? "#ff0050" : "#555", fontSize: 11, fontWeight: 700, minWidth: 30 }}>
-              {opacity}%
-            </span>
-            {opacity < 100 && (
-              <button onClick={() => setOpacity(100)} style={{
-                background: "#ff005022", border: "none", borderRadius: 5,
-                padding: "2px 7px", color: "#ff0050", fontSize: 10, cursor: "pointer",
-              }}>reset</button>
-            )}
-          </div>
-          {/* Focus Mode */}
-          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-            <span style={{ color: "#888", fontSize: 11 }}>🧠 Focus:</span>
-            {FOCUS_PRESETS.map(({ label, mins, icon }) => (
-              <button key={mins} onClick={() => startFocus(mins)} style={{
-                background: focusActive && focusTotalSec === mins * 60 ? "#ff0050" : "#ffffff14",
-                border: "none", borderRadius: 5, padding: "2px 8px",
-                color: focusActive && focusTotalSec === mins * 60 ? "#fff" : "#aaa",
-                fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", gap: 3,
-              }}>{icon} {label}</button>
-            ))}
-            {focusActive && (
-              <button onClick={stopFocus} style={{
-                background: "#ff005033", border: "none", borderRadius: 5, padding: "2px 7px",
-                color: "#ff0050", fontSize: 11, cursor: "pointer",
-              }}>✕ off</button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* ── Bookmark Panel ── */}
-      {showBookmarks && (
-        <div style={{
-          background: "#0d0d1a", borderBottom: "1px solid #ffd70033",
-          padding: "10px 12px", flexShrink: 0, maxHeight: 220, overflowY: "auto",
-        }}>
-          {/* Add bookmark row */}
-          <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
-            <input
-              value={bookmarkLabel}
-              onChange={e => setBookmarkLabel(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && addBookmark()}
-              placeholder={`Label (default: current time)`}
-              style={{
-                flex: 1, background: "#ffffff0d", border: "1px solid #ffd70033",
-                borderRadius: 7, padding: "5px 10px", color: "#fff",
-                fontSize: 11, outline: "none",
-              }}
-            />
-            <button onClick={addBookmark} style={{
-              background: "linear-gradient(135deg,#ffd700,#cc9900)",
-              border: "none", borderRadius: 7, padding: "5px 12px",
-              color: "#000", cursor: "pointer", fontSize: 11, fontWeight: 700,
-            }}>🔖 Mark</button>
-          </div>
-
-          {/* Bookmark list */}
-          {bookmarks.length === 0 && (
-            <div style={{ color: "#444", fontSize: 11, textAlign: "center", padding: "8px 0" }}>
-              No bookmarks yet — hit Mark to save current position
-            </div>
-          )}
-          {bookmarks.map(bm => (
-            <div key={bm.id} style={{
-              display: "flex", alignItems: "center", gap: 8,
-              padding: "5px 6px", borderRadius: 7, marginBottom: 3,
-              background: "#ffffff07", cursor: "pointer",
-              transition: "background 0.12s",
-            }}
-              onMouseEnter={e => e.currentTarget.style.background = "#ffd70011"}
-              onMouseLeave={e => e.currentTarget.style.background = "#ffffff07"}
-            >
-              {/* Progress indicator */}
-              <div style={{ position:"relative", width:36, height:4, background:"#ffffff11", borderRadius:2, flexShrink:0 }}>
-                <div style={{
-                  position:"absolute", left:0, top:0, height:"100%", borderRadius:2,
-                  background:"#ffd700",
-                  width: `${duration ? Math.min(100,(bm.time/duration)*100) : 0}%`,
-                }}/>
-              </div>
-              <span style={{ color: "#ffd700", fontSize: 11, fontWeight: 700,
-                fontFamily: "monospace", flexShrink: 0 }}>{fmtTime(bm.time)}</span>
-              <span style={{ color: "#ccc", fontSize: 11, flex: 1,
-                overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{bm.label}</span>
-              <button onClick={() => jumpToBookmark(bm.time)} style={{
-                background: "#ffd70022", border: "1px solid #ffd70044",
-                borderRadius: 5, padding: "2px 8px", color: "#ffd700",
-                cursor: "pointer", fontSize: 10, fontWeight: 700, flexShrink:0,
-              }}>▶ Jump</button>
-              <button onClick={() => removeBookmark(bm.id)} style={{
-                background:"none", border:"none", color:"#444",
-                cursor:"pointer", fontSize:13, flexShrink:0,
-              }}>✕</button>
-            </div>
-          ))}
-        </div>
-      )}
-
-      {/* ── Video area ── */}
-      {!musicMode && (
-        <div style={{ flex: 1, position: "relative" }}
-          onMouseEnter={() => setShowCtrl(true)}
-          onMouseLeave={() => setShowCtrl(false)}>
-          <div ref={playerDivRef} id={`yt-mini-${video.id}`} style={{ width: "100%", height: "100%" }} />
-
-          {/* ── Embed Error Fallback ── */}
-          {embedError && (
-            <div style={{
-              position: "absolute", inset: 0,
-              background: "#0f0f0f",
-              display: "flex", flexDirection: "column",
-              alignItems: "center", justifyContent: "center",
-              gap: 14, padding: 20, zIndex: 10,
-            }}>
-              {/* Thumbnail */}
-              <img src={video.thumb} alt=""
-                style={{ width: "100%", maxWidth: 280, borderRadius: 10, objectFit: "cover", opacity: 0.6 }} />
-              {/* Error message */}
-              <div style={{ textAlign: "center" }}>
-                <div style={{ color: "#fff", fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
-                  {embedError.code === 100 ? "🔒 Video unavailable" : "⚠ Embedding not allowed"}
-                </div>
-                <div style={{ color: "#aaa", fontSize: 12, lineHeight: 1.5 }}>
-                  {embedError.code === 100
-                    ? "This video is private or has been removed."
-                    : "The video owner has disabled embedding.\nWatch it directly on YouTube."}
-                </div>
-              </div>
-              {/* Open in YouTube button */}
-              <a href={`https://www.youtube.com/watch?v=${video.id}`}
-                target="_blank" rel="noopener noreferrer"
-                style={{
-                  background: "#ff0000", color: "#fff",
-                  border: "none", borderRadius: 24,
-                  padding: "11px 24px", fontSize: 14, fontWeight: 700,
-                  textDecoration: "none", display: "flex", alignItems: "center", gap: 8,
-                }}>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="#fff"><path d="M10 15l5.19-3L10 9v6m11.56-7.83c.13.47.22 1.1.28 1.9.07.8.1 1.49.1 2.09L22 12c0 2.19-.16 3.8-.44 4.83-.25.9-.83 1.48-1.73 1.73-.47.13-1.33.22-2.65.28-1.3.07-2.49.1-3.59.1L12 19c-4.19 0-6.8-.16-7.83-.44-.9-.25-1.48-.83-1.73-1.73-.13-.47-.22-1.1-.28-1.9-.07-.8-.1-1.49-.1-2.09L2 12c0-2.19.16-3.8.44-4.83.25-.9.83-1.48 1.73-1.73.47-.13 1.33-.22 2.65-.28 1.3-.07 2.49-.1 3.59-.1L12 5c4.19 0 6.8.16 7.83.44.9.25 1.48.83 1.73 1.73z"/></svg>
-                Watch on YouTube
-              </a>
-            </div>
-          )}
-
-          {/* Controls overlay — hidden when embed error shown */}
-          {!embedError && <div style={{
-            position: "absolute", inset: 0, display: "flex", flexDirection: "column",
-            justifyContent: "flex-end", pointerEvents: showCtrl ? "auto" : "none",
-            background: showCtrl ? "linear-gradient(transparent 40%, #000c)" : "transparent",
-            transition: "background 0.2s",
-          }}>
-            {showCtrl && (
-              <div style={{ padding: "6px 10px 8px" }}>
-                {/* Progress bar */}
-                <div onClick={seekTo} style={{
-                  height: 4, background: "#ffffff22", borderRadius: 2,
-                  cursor: "pointer", marginBottom: 8, position: "relative",
-                }}>
-                  <div style={{
-                    position: "absolute", left: 0, top: 0, height: "100%",
-                    width: `${duration ? (progress / duration) * 100 : 0}%`,
-                    background: "#ff0050", borderRadius: 2,
-                    transition: "width 0.4s linear",
-                  }} />
-                  {/* bookmark dots on progress bar */}
-                  {duration > 0 && bookmarks.map(bm => (
-                    <div key={bm.id} onClick={e => { e.stopPropagation(); jumpToBookmark(bm.time); }}
-                      title={`🔖 ${bm.label}`}
-                      style={{
-                        position: "absolute", top: "50%", transform: "translateY(-50%)",
-                        left: `${(bm.time / duration) * 100}%`,
-                        width: 8, height: 8, background: "#ffd700",
-                        borderRadius: "50%", marginLeft: -4, zIndex: 2,
-                        boxShadow: "0 0 6px #ffd70099", cursor: "pointer",
-                        flexShrink: 0,
-                      }} />
-                  ))}
-                  {/* thumb */}
-                  <div style={{
-                    position: "absolute", top: "50%", transform: "translateY(-50%)",
-                    left: `${duration ? (progress / duration) * 100 : 0}%`,
-                    width: 10, height: 10, background: "#ff0050",
-                    borderRadius: "50%", marginLeft: -5,
-                    boxShadow: "0 0 6px #ff005088",
-                  }} />
-                </div>
-
-                {/* Button row */}
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <button onClick={onPrev}                style={btn()}>⏮</button>
-                  <button onClick={() => skipSec(-10)}    style={btn({ fontSize: 13 })}>⏪10</button>
-                  <button onClick={togglePlay}            style={btn({ color: "#ff0050", fontSize: 20 })}>{playing?"⏸":"▶"}</button>
-                  <button onClick={() => skipSec(10)}     style={btn({ fontSize: 13 })}>10⏩</button>
-                  <button onClick={onNext}                style={btn()}>⏭</button>
-                  <span style={{ color: "#aaa", fontSize: 10, flex: 1, textAlign: "center" }}>
-                    {fmtTime(progress)} / {fmtTime(duration)}
-                  </span>
-                  <button onClick={toggleMute} style={btn({ fontSize: 13 })}>{muted ? "🔇" : "🔊"}</button>
-                  <input type="range" min={0} max={100} value={muted ? 0 : volume}
-                    onChange={e => changeVol(+e.target.value)}
-                    style={{ width: 56, accentColor: "#ff0050", cursor: "pointer" }} />
-                  <button onClick={toggleFullscreen} title="Fullscreen (V)"
-                    style={btn({ color: isFullscreen ? "#ff0050" : "#aaa", fontSize: 14 })}>⛶</button>
-                </div>
-              </div>
-            )}
-          </div>}
-        </div>
-      )}
-
-      {/* ── Music mode UI ── */}
-      {musicMode && (
-        <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 12, padding: "8px 14px" }}>
-          <div ref={playerDivRef} style={{ display: "none" }} />
-          <img src={video.thumb}
-            style={{ width: 60, height: 44, borderRadius: 8, objectFit: "cover", flexShrink: 0 }} alt="" />
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ color: "#fff", fontSize: 11, fontWeight: 700, marginBottom: 6,
-              whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{video.title}</div>
-            {/* mini progress */}
-            <div onClick={seekTo} style={{
-              height: 3, background: "#ffffff22", borderRadius: 2, cursor: "pointer", marginBottom: 6,
-            }}>
-              <div style={{ height: "100%", background: "#ff0050", borderRadius: 2,
-                width: `${duration ? (progress / duration) * 100 : 0}%` }} />
-            </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <button onClick={onPrev}             style={btn()}>⏮</button>
-              <button onClick={() => skipSec(-10)} style={btn({ fontSize: 12 })}>⏪</button>
-              <button onClick={togglePlay}         style={btn({ color: "#ff0050", fontSize: 18 })}>{playing?"⏸":"▶"}</button>
-              <button onClick={() => skipSec(10)}  style={btn({ fontSize: 12 })}>⏩</button>
-              <button onClick={onNext}             style={btn()}>⏭</button>
-              <span style={{ color: "#555", fontSize: 10, flex: 1, textAlign: "right" }}>{fmtTime(progress)}</span>
-            </div>
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
-            <button onClick={toggleMute} style={btn({ fontSize: 12 })}>{muted ? "🔇" : "🔊"}</button>
-            <input type="range" min={0} max={100} value={muted ? 0 : volume}
-              onChange={e => changeVol(+e.target.value)}
-              style={{ writingMode: "vertical-lr", direction: "rtl", height: 50, accentColor: "#ff0050" }} />
-          </div>
-        </div>
-      )}
-
-      {/* ── Resize handle ── */}
-      {!musicMode && (
-        <div data-resize="true"
-          onMouseDown={onResizeStart} onTouchStart={onResizeStart}
-          style={{
-            position: "absolute", bottom: 0, right: 0, width: 22, height: 22,
-            cursor: "se-resize", display: "flex", alignItems: "flex-end",
-            justifyContent: "flex-end", paddingRight: 4, paddingBottom: 4,
-          }}>
-          <svg width="11" height="11" viewBox="0 0 11 11">
-            <path d="M2 11L11 2M5 11L11 5M8 11L11 8" stroke="#ff0050" strokeWidth="1.5" opacity=".6"/>
-          </svg>
-        </div>
-      )}
-    </div>
-    </>
-  );
-}
-
-// ══════════════════════════════════════════════════════════
 //  Video Card
 // ══════════════════════════════════════════════════════════
 function VideoCard({ video, onPlay, isPlaying, isFav, onToggleFav, onAddToSaved, onAddToQueue, isQueued, recommendScore }) {
@@ -2324,8 +1536,35 @@ function FloatTubeApp() {
   const clearQueue     = ()      => setQueue([]);
   const isQueued       = (id)    => queue.some(v => v.id === id);
 
+
   // ── Recommendation Engine ──
+  const [realRecommendations, setRealRecommendations] = useState([]);
+  const [recoLoading, setRecoLoading] = useState(false);
+
+  // Load real API recommendations when tab switches to recommended
+  useEffect(() => {
+    if (tab !== "recommended") return;
+    if (realRecommendations.length > 0) return;
+    if (history.length === 0 && favourites.length === 0) return;
+    setRecoLoading(true);
+    // Pick top channels from history
+    const channels = {};
+    [...history, ...favourites].forEach(v => { channels[v.channel] = (channels[v.channel]||0)+1; });
+    const topChannel = Object.entries(channels).sort((a,b)=>b[1]-a[1])[0]?.[0];
+    const searchQ = topChannel && topChannel !== "YouTube"
+      ? topChannel
+      : (history[0]?.title?.split(" ").slice(0,3).join(" ") || "trending music");
+    apiSearch(searchQ, 20).then(result => {
+      if (result?.videos.length > 0) {
+        const watchedIds = new Set(history.map(v => v.id));
+        setRealRecommendations(result.videos.filter(v => !watchedIds.has(v.id)));
+      }
+      setRecoLoading(false);
+    }).catch(() => setRecoLoading(false));
+  }, [tab]);
+
   const recommendations = useMemo(() => {
+    if (realRecommendations.length > 0) return realRecommendations;
     if (history.length === 0 && favourites.length === 0) return [];
     const watchedIds   = new Set(history.map(v => v.id));
     const favChannels  = new Set(favourites.map(v => v.channel));
@@ -2360,7 +1599,7 @@ function FloatTubeApp() {
       return [...scored, ...padding];
     }
     return scored;
-  }, [history, favourites]);
+  }, [history, favourites, realRecommendations]);
 
   // ── tab display ──
   const tabVideos = { home: results, history, favourites, search: results, recommended: recommendations, playlists: [] }[tab] ?? results;
@@ -2996,8 +2235,23 @@ function FloatTubeApp() {
               </div>
             )}
 
+            {/* ── Recommended loading skeleton ── */}
+            {tab === "recommended" && recoLoading && recommendations.length === 0 && (
+              <div style={{ padding: "0 14px" }}>
+                {[1,2,3,4,5].map(i => (
+                  <div key={i} style={{ display: "flex", gap: 10, marginBottom: 12, alignItems: "center" }}>
+                    <div className="shimmer-bg" style={{ width: 120, height: 68, borderRadius: 8, flexShrink: 0 }} />
+                    <div style={{ flex: 1 }}>
+                      <div className="shimmer-bg" style={{ height: 13, borderRadius: 4, marginBottom: 6 }} />
+                      <div className="shimmer-bg" style={{ height: 11, borderRadius: 4, width: "60%" }} />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {/* ── Empty state ── */}
-            {tabVideos.length === 0 && !(tab === "search" && ytSearching) && (
+            {tabVideos.length === 0 && !(tab === "search" && ytSearching) && !(tab === "recommended" && recoLoading) && (
               <div style={{ textAlign: "center", padding: "70px 20px" }}>
                 <div style={{ fontSize: 48, marginBottom: 14 }}>
                   {tab === "history" ? "🕘" : tab === "favourites" ? "★" : tab === "search" ? "🔍" : "🎯"}
@@ -3137,6 +2391,44 @@ function FloatTubeApp() {
                   cursor: "pointer", fontSize: 11,
                 }}>⇀ Shuffle</button>
               </div>
+            )}
+
+            {/* ── Load More (search tab only) ── */}
+            {tab === "search" && apiSearchNextPage && (
+              <div style={{ padding: "12px 14px 80px", textAlign: "center" }}>
+                <button onClick={async () => {
+                  setApiToast("🔍 Loading more...");
+                  try {
+                    const data = await ytFetch("search", {
+                      part: "snippet", q: query, type: "video",
+                      maxResults: 20, pageToken: apiSearchNextPage,
+                    });
+                    const ids = data.items.map(i => i.id.videoId).filter(Boolean).join(",");
+                    if (ids) {
+                      const details = await ytFetch("videos", { part: "snippet,statistics,contentDetails", id: ids });
+                      const more = details.items.map(ytItemToVideo);
+                      setResults(prev => [...prev, ...more]);
+                      setPlaylist(prev => [...prev, ...more]);
+                    }
+                    setApiSearchNextPage(data.nextPageToken || null);
+                    setApiToast("");
+                  } catch {
+                    setApiToast("⚠ Could not load more");
+                    setTimeout(() => setApiToast(""), 2000);
+                  }
+                }} style={{
+                  background: "#272727", border: "1px solid #444",
+                  borderRadius: 24, padding: "10px 28px",
+                  color: "#f1f1f1", cursor: "pointer", fontSize: 13, fontWeight: 600,
+                }}>
+                  Load more results
+                </button>
+              </div>
+            )}
+
+            {/* Bottom padding so last item isn't hidden behind nav */}
+            {(tab !== "search" || !apiSearchNextPage) && (
+              <div style={{ height: 80 }} />
             )}
           </>
         )}
@@ -3366,14 +2658,29 @@ function FloatTubeApp() {
 
                   {/* Google Identity Services Sign In */}
                   <div style={{ width: "100%", maxWidth: 320 }}>
-                    <div style={{ color: "#555", fontSize: 11, textAlign: "center", marginBottom: 16, lineHeight: 1.6 }}>
-                      Sign in with your real Google account to access YouTube subscriptions and history.
+                    {/* Show current origin — user needs to add this to Google Console */}
+                    <div style={{
+                      background: "#1a1a1a", border: "1px solid #ff000033",
+                      borderRadius: 10, padding: "10px 14px", marginBottom: 14,
+                    }}>
+                      <div style={{ color: "#aaa", fontSize: 10, marginBottom: 6, fontWeight: 600 }}>
+                        ⚠ ADD THIS TO GOOGLE CONSOLE
+                      </div>
+                      <div style={{ color: "#3ea6ff", fontSize: 11, wordBreak: "break-all",
+                        fontFamily: "monospace", marginBottom: 8 }}>
+                        {window.location.origin}
+                      </div>
+                      <div style={{ color: "#555", fontSize: 10, lineHeight: 1.5 }}>
+                        Go to: console.cloud.google.com → Credentials → OAuth Client → Authorized JavaScript Origins
+                      </div>
+                    </div>
+                    <div style={{ color: "#555", fontSize: 11, textAlign: "center", marginBottom: 14, lineHeight: 1.6 }}>
+                      Sign in with your real Google account.
                     </div>
                     <button onClick={() => {
                       setApiToast("🔐 Opening Google sign-in...");
                       googleSignIn(async (err, token) => {
                         if (err) {
-                          // GIS errors are usually user-cancelled, not a blocker
                           if (err.message === "popup_closed_by_user" || err.message?.includes("closed")) {
                             setApiToast("");
                           } else {
@@ -3415,8 +2722,7 @@ function FloatTubeApp() {
                       Continue with Google
                     </button>
                     <div style={{ color: "#555", fontSize: 10, textAlign: "center", marginTop: 10, lineHeight: 1.5 }}>
-                      Uses Google Identity Services.<br/>
-                      No redirect URL required.
+                      Uses Google Identity Services. No redirect URL required.
                     </div>
                   </div>
                 </div>
@@ -3934,6 +3240,9 @@ function YouTubeInlinePlayer({ video, onClose, onMinimize, onNext, onPrev, onEnd
   const [playbackRate, setPlaybackRate] = useState(1);
   const [showSpeed,    setShowSpeed]    = useState(false);
   const [isSeeking,    setIsSeeking]    = useState(false);
+  const [toast,        setToast]        = useState("");
+  const [embedError,   setEmbedError]   = useState(null); // null | {code, msg}
+  const [speed,        setSpeed]        = useState(1);
 
   // ── Info panel state ──
   const [liked,        setLiked]        = useState(false);
@@ -3998,29 +3307,44 @@ function YouTubeInlinePlayer({ video, onClose, onMinimize, onNext, onPrev, onEnd
 
   // ── Init player ──
   useEffect(() => {
+    setEmbedError(null);
     loadYTScript().then((YT) => {
       if (ytRef.current) { ytRef.current.destroy(); ytRef.current = null; }
       if (!playerDivRef.current) return;
+      const currentOrigin = (window.location.protocol === "file:" || window.location.protocol === "content:")
+        ? "https://www.youtube.com" : window.location.origin;
       ytRef.current = new YT.Player(playerDivRef.current, {
         videoId: video.id,
+        host: "https://www.youtube-nocookie.com",
         playerVars: {
           autoplay: 1, controls: 0, rel: 0, modestbranding: 1,
           iv_load_policy: 3, playsinline: 1, enablejsapi: 1,
-          origin: (window.location.protocol === "file:" || window.location.protocol === "content:")
-            ? "https://www.youtube.com"
-            : window.location.origin,
-          widget_referrer: "https://www.youtube.com",
+          origin: currentOrigin,
         },
         events: {
-          onReady: (e) => { e.target.setVolume(volume); },
+          onReady: (e) => {
+            e.target.setVolume(volume);
+            e.target.setPlaybackRate(speed);
+            if (muted) e.target.mute();
+          },
           onStateChange: (e) => {
             if (e.data === YT.PlayerState.PLAYING) { setPlaying(true);  startTick(); }
             if (e.data === YT.PlayerState.PAUSED)  { setPlaying(false); stopTick();  }
             if (e.data === YT.PlayerState.ENDED)   { stopTick(); onEnded?.(); }
           },
           onError: (e) => {
-            const msgs = { 2:"Invalid video ID", 5:"HTML5 error", 100:"Video not found", 101:"Embed not allowed", 150:"Embed not allowed" };
-            setToast(`⚠ ${msgs[e.data] || "Playback error"}`);
+            const msgs = {
+              2: "Invalid video ID",
+              5: "HTML5 player error",
+              100: "Video not found or private",
+              101: "Embedding not allowed by owner",
+              150: "Embedding not allowed by owner",
+            };
+            const msg = msgs[e.data] || `Playback error (${e.data})`;
+            setToast(`⚠ ${msg}`);
+            if (e.data === 101 || e.data === 150 || e.data === 100) {
+              setEmbedError({ code: e.data, msg });
+            }
             setPlaying(false);
           },
         },
@@ -4242,6 +3566,50 @@ function YouTubeInlinePlayer({ video, onClose, onMinimize, onNext, onPrev, onEnd
       >
         {/* IFrame mount point */}
         <div ref={playerDivRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%" }} />
+
+        {/* ── Embed Error Fallback ── */}
+        {embedError && (
+          <div style={{
+            position: "absolute", inset: 0, background: "#0f0f0f",
+            display: "flex", flexDirection: "column",
+            alignItems: "center", justifyContent: "center",
+            gap: 14, padding: 20, zIndex: 20,
+          }}>
+            <img src={video.thumb} alt=""
+              style={{ width: "80%", maxWidth: 260, borderRadius: 10, objectFit: "cover", opacity: 0.5 }} />
+            <div style={{ textAlign: "center" }}>
+              <div style={{ color: "#fff", fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
+                {embedError.code === 100 ? "🔒 Video unavailable" : "⚠ Embedding disabled"}
+              </div>
+              <div style={{ color: "#aaa", fontSize: 11, lineHeight: 1.5 }}>
+                {embedError.code === 100
+                  ? "This video is private or removed."
+                  : "Owner disabled embedding. Open on YouTube."}
+              </div>
+            </div>
+            <a href={`https://www.youtube.com/watch?v=${video.id}`}
+              target="_blank" rel="noopener noreferrer"
+              style={{
+                background: "#ff0000", color: "#fff",
+                borderRadius: 22, padding: "10px 22px",
+                fontSize: 13, fontWeight: 700, textDecoration: "none",
+                display: "flex", alignItems: "center", gap: 7,
+              }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M10 15l5.19-3L10 9v6m11.56-7.83c.13.47.22 1.1.28 1.9.07.8.1 1.49.1 2.09L22 12c0 2.19-.16 3.8-.44 4.83-.25.9-.83 1.48-1.73 1.73-.47.13-1.33.22-2.65.28-1.3.07-2.49.1-3.59.1L12 19c-4.19 0-6.8-.16-7.83-.44-.9-.25-1.48-.83-1.73-1.73-.13-.47-.22-1.1-.28-1.9-.07-.8-.1-1.49-.1-2.09L2 12c0-2.19.16-3.8.44-4.83.25-.9.83-1.48 1.73-1.73.47-.13 1.33-.22 2.65-.28 1.3-.07 2.49-.1 3.59-.1L12 5c4.19 0 6.8.16 7.83.44.9.25 1.48.83 1.73 1.73z"/></svg>
+              Watch on YouTube
+            </a>
+          </div>
+        )}
+
+        {/* ── Toast notification ── */}
+        {toast && (
+          <div style={{
+            position: "absolute", bottom: 60, left: "50%", transform: "translateX(-50%)",
+            background: "#0009", borderRadius: 6, padding: "6px 14px",
+            color: "#fff", fontSize: 12, zIndex: 30, whiteSpace: "nowrap",
+            animation: "fadeIn 0.2s ease",
+          }}>{toast}</div>
+        )}
 
         {/* ── Controls Overlay ── */}
         <div style={{
