@@ -285,6 +285,7 @@ function googleSignIn(callback) {
         scope: [
           "https://www.googleapis.com/auth/userinfo.profile",
           "https://www.googleapis.com/auth/userinfo.email",
+          "https://www.googleapis.com/auth/youtube.readonly",
         ].join(" "),
         callback: (response) => {
           if (response.error) {
@@ -313,19 +314,144 @@ async function googleGetUserInfo(accessToken) {
   return res.json();
 }
 
-// Fetch YouTube account subscriptions (when signed in)
+// ── Fetch subscribed channels (login required) ──
 async function apiMySubscriptions(accessToken, maxResults = 50) {
   const url = new URL(`${YT_API_BASE}/subscriptions`);
   url.searchParams.set("part", "snippet");
   url.searchParams.set("mine", "true");
   url.searchParams.set("maxResults", maxResults);
+  url.searchParams.set("order", "relevance");
   const res = await fetch(url.toString(), { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!res.ok) throw new Error(`Subscriptions API ${res.status}`);
   const data = await res.json();
   return (data.items || []).map(item => ({
     id:        item.snippet.resourceId.channelId,
     name:      item.snippet.title,
     thumb:     item.snippet.thumbnails?.default?.url,
+    publishedAt: item.snippet.publishedAt,
   }));
+}
+
+// ── Fetch latest videos from a set of channel IDs ──
+// Returns embeddable videos sorted by publishedAt (newest first)
+async function apiChannelLatestVideos(channelIds, maxPerChannel = 5) {
+  if (!channelIds || channelIds.length === 0) return [];
+  // Batch: fetch latest 3-5 videos per channel in parallel (up to 10 channels at once)
+  const batches = [];
+  for (let i = 0; i < channelIds.length; i += 10) {
+    batches.push(channelIds.slice(i, i + 10));
+  }
+  const allVideos = [];
+  for (const batch of batches) {
+    const searches = batch.map(channelId =>
+      ytFetch("search", {
+        part: "snippet",
+        channelId,
+        type: "video",
+        maxResults: maxPerChannel,
+        order: "date",
+      }).catch(() => ({ items: [] }))
+    );
+    const results = await Promise.all(searches);
+    const ids = results.flatMap(d => (d.items || []).map(i => i.id?.videoId)).filter(Boolean);
+    if (ids.length === 0) continue;
+    // Batch fetch details+status
+    const details = await ytFetch("videos", {
+      part: "snippet,statistics,contentDetails,status",
+      id: ids.join(","),
+    }).catch(() => ({ items: [] }));
+    const videos = (details.items || [])
+      .filter(item => item.status?.embeddable !== false)
+      .map(ytItemToVideo);
+    allVideos.push(...videos);
+  }
+  // Sort newest first
+  allVideos.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt));
+  return allVideos;
+}
+
+// ── Build personalized home feed when logged in ──
+// Mixes: latest from subscriptions + algorithm (trending weighted by watch history)
+async function apiPersonalizedFeed(accessToken, historyVideos = [], maxResults = 30) {
+  let subChannelIds = [];
+  let subChannels = [];
+  try {
+    subChannels = await apiMySubscriptions(accessToken, 50);
+    subChannelIds = subChannels.map(c => c.id);
+  } catch (e) {
+    console.warn("Could not fetch subscriptions:", e.message);
+  }
+
+  // ── 1. Subscription feed: latest from subscribed channels ──
+  let subVideos = [];
+  if (subChannelIds.length > 0) {
+    // Limit channels to avoid too many API calls: prioritize most-watched channels
+    const watchedChannelFreq = {};
+    historyVideos.forEach(v => {
+      watchedChannelFreq[v.channelId || v.channel] = (watchedChannelFreq[v.channelId || v.channel] || 0) + 1;
+    });
+    // Sort subscribed channels: most watched first, then rest
+    const sortedChannelIds = [...subChannelIds].sort((a, b) => {
+      const fa = subChannels.find(c => c.id === a);
+      const fb = subChannels.find(c => c.id === b);
+      const wa = watchedChannelFreq[a] || watchedChannelFreq[fa?.name] || 0;
+      const wb = watchedChannelFreq[b] || watchedChannelFreq[fb?.name] || 0;
+      return wb - wa;
+    });
+    // Fetch from top 20 channels max (API quota protection)
+    subVideos = await apiChannelLatestVideos(sortedChannelIds.slice(0, 20), 3);
+  }
+
+  // ── 2. Algorithm feed: based on watch history keywords ──
+  let algoVideos = [];
+  const watchedIds = new Set([...historyVideos.map(v => v.id), ...subVideos.map(v => v.id)]);
+  
+  try {
+    // Build query from recent watch history
+    const stopWords = new Set(["the","a","an","in","of","for","ft","and","to","on","by","feat","official","video","music","lyrics"]);
+    const keywords = historyVideos.slice(0, 15)
+      .flatMap(v => v.title.toLowerCase().replace(/[^a-z0-9 ]/g," ").split(" "))
+      .filter(w => w.length > 3 && !stopWords.has(w));
+    const freq = {};
+    keywords.forEach(w => { freq[w] = (freq[w] || 0) + 1; });
+    const topKeywords = Object.entries(freq).sort((a,b)=>b[1]-a[1]).slice(0,4).map(([w])=>w);
+    
+    // Use top keywords or trending fallback
+    const algoQuery = topKeywords.length > 1
+      ? topKeywords.slice(0, 3).join(" ")
+      : "trending music 2025";
+    
+    const result = await apiSearch(algoQuery, 20);
+    algoVideos = (result?.videos || []).filter(v => !watchedIds.has(v.id));
+  } catch {}
+
+  // ── 3. Merge: subscription videos first, then algorithm, deduplicated ──
+  const merged = [];
+  const seenIds = new Set();
+  
+  // Interleave: every 3 sub videos → 1 algo video (like real YouTube)
+  const subQueue  = [...subVideos];
+  const algoQueue = [...algoVideos];
+  let subTake = 0;
+  
+  while (merged.length < maxResults && (subQueue.length > 0 || algoQueue.length > 0)) {
+    if (subQueue.length > 0 && subTake < 3) {
+      const v = subQueue.shift();
+      if (!seenIds.has(v.id)) { seenIds.add(v.id); merged.push({ ...v, _fromSub: true }); subTake++; }
+    } else if (algoQueue.length > 0) {
+      const v = algoQueue.shift();
+      if (!seenIds.has(v.id)) { seenIds.add(v.id); merged.push(v); }
+      subTake = 0;
+    } else {
+      subTake = 0;
+      if (subQueue.length > 0) {
+        const v = subQueue.shift();
+        if (!seenIds.has(v.id)) { seenIds.add(v.id); merged.push({ ...v, _fromSub: true }); }
+      }
+    }
+  }
+
+  return { videos: merged, subChannels };
 }
 
 // ── useYouTubeSearch hook ──
@@ -1359,6 +1485,13 @@ function FloatTubeApp() {
   // Sync googleAccount to window so YouTubeInlinePlayer (child) can access it
   useEffect(() => { window.__googleAccount = googleAccount; }, [googleAccount]);
 
+  // ── Subscription & personalized feed state ──
+  const [subChannels,      setSubChannels]      = useState([]); // [{id, name, thumb}]
+  const [subFeedVideos,    setSubFeedVideos]     = useState([]); // latest from subscribed channels
+  const [subFeedLoading,   setSubFeedLoading]    = useState(false);
+  const [subFeedLoaded,    setSubFeedLoaded]     = useState(false);
+  const [personalizedFeed, setPersonalizedFeed]  = useState([]); // home feed when logged in
+
   // ── YouTube API state ──
   const { search: ytSearch, searching: ytSearching } = useYouTubeSearch();
   const { trending, loading: trendingLoading, load: loadTrending } = useYouTubeTrending();
@@ -1447,21 +1580,93 @@ function FloatTubeApp() {
     playVideo(src[(idx - 1 + src.length) % src.length]);
   }, [currentVideo, playlist, playVideo]);
 
-  // ── Load trending on home tab ──
+  // ── Load home feed (personalized if logged in, else trending) ──
   useEffect(() => {
-    if (tab === "home" && !homeLoaded && trending.length === 0) {
-      setHomeLoaded(true);
-      loadTrending("BD").then(() => {}).catch(() => {});
-    }
-  }, [tab, homeLoaded, trending.length, loadTrending]);
+    if (tab !== "home") return;
+    const token = googleAccount?.accessToken;
 
-  // When trending loads, update results for home tab
+    if (token) {
+      // ── Logged in: personalized feed ──
+      if (personalizedFeed.length > 0) {
+        // Already loaded for this session, just show it
+        setResults(personalizedFeed);
+        setPlaylist(personalizedFeed);
+        return;
+      }
+      setHomeLoaded(true);
+      setApiToast("⏳ Loading your feed...");
+      apiPersonalizedFeed(token, history, 30)
+        .then(({ videos, subChannels: channels }) => {
+          setSubChannels(channels || []);
+          if (videos.length > 0) {
+            setPersonalizedFeed(videos);
+            setResults(videos);
+            setPlaylist(videos);
+            setApiToast("");
+          } else {
+            // Fallback to trending if personalized fetch failed
+            loadTrending("BD");
+            setApiToast("⚠ Showing trending — subscription feed unavailable");
+            setTimeout(() => setApiToast(""), 3000);
+          }
+        })
+        .catch(() => {
+          loadTrending("BD");
+          setApiToast("⚠ Could not load subscription feed");
+          setTimeout(() => setApiToast(""), 3000);
+        });
+    } else {
+      // ── Not logged in: trending ──
+      if (!homeLoaded && trending.length === 0) {
+        setHomeLoaded(true);
+        loadTrending("BD").then(() => {}).catch(() => {});
+      }
+    }
+  }, [tab, googleAccount?.accessToken]);
+
+  // When trending loads (non-logged-in), update home feed
   useEffect(() => {
-    if (tab === "home" && trending.length > 0) {
+    if (tab === "home" && !googleAccount?.accessToken && trending.length > 0) {
       setResults(trending);
       setPlaylist(trending);
     }
   }, [trending]);
+
+  // When user logs in or out → reset and reload home feed
+  useEffect(() => {
+    setPersonalizedFeed([]);
+    setSubChannels([]);
+    setSubFeedVideos([]);
+    setSubFeedLoaded(false);
+    setHomeLoaded(false);
+    if (tab === "home") {
+      setResults([]);
+    }
+  }, [googleAccount?.accessToken]);
+
+  // ── Load subscription-only feed when Subscriptions tab is opened ──
+  useEffect(() => {
+    if (tab !== "recommended") return;
+    const token = googleAccount?.accessToken;
+    if (!token) return;
+    if (subFeedLoaded && subFeedVideos.length > 0) return; // already loaded
+
+    setSubFeedLoading(true);
+    apiMySubscriptions(token, 50)
+      .then(channels => {
+        setSubChannels(channels);
+        const channelIds = channels.map(c => c.id);
+        return apiChannelLatestVideos(channelIds.slice(0, 25), 5)
+          .then(videos => {
+            setSubFeedVideos(videos);
+            setSubFeedLoaded(true);
+            setSubFeedLoading(false);
+          });
+      })
+      .catch(() => {
+        setSubFeedLoading(false);
+      });
+  }, [tab, googleAccount?.accessToken]);
 
   // ── search ──
   const handleSearch = async (e) => {
@@ -1656,7 +1861,12 @@ function FloatTubeApp() {
   }, [history, favourites, realRecommendations]);
 
   // ── tab display ──
-  const tabVideos = { home: results, history, favourites, search: results, recommended: recommendations, playlists: [] }[tab] ?? results;
+  // "recommended" tab = subscriptions feed when logged in, else local recommendations
+  const token = googleAccount?.accessToken;
+  const recommendedTabVideos = token
+    ? (subFeedVideos.length > 0 ? subFeedVideos : recommendations)
+    : recommendations;
+  const tabVideos = { home: results, history, favourites, search: results, recommended: recommendedTabVideos, playlists: [] }[tab] ?? results;
 
   // Bottom nav tab → main tab mapping
   const BOTTOM_NAV = [
@@ -1793,16 +2003,33 @@ function FloatTubeApp() {
             {/* Refresh icon */}
             <button onClick={async () => {
               setHomeLoaded(false);
+              setPersonalizedFeed([]);
+              setSubFeedVideos([]);
+              setSubFeedLoaded(false);
               setResults([]);
               setApiToast("🔄 Refreshing...");
+              const tok = googleAccount?.accessToken;
               try {
-                const videos = await apiTrending("BD", 20);
-                setResults(videos);
-                setPlaylist(videos);
-                setApiToast("");
+                if (tok) {
+                  const { videos, subChannels: channels } = await apiPersonalizedFeed(tok, history, 30);
+                  if (channels) setSubChannels(channels);
+                  if (videos.length > 0) {
+                    setPersonalizedFeed(videos);
+                    setResults(videos);
+                    setPlaylist(videos);
+                    setApiToast("");
+                  } else throw new Error("empty");
+                } else {
+                  const videos = await apiTrending("BD", 20);
+                  setResults(videos);
+                  setPlaylist(videos);
+                  setApiToast("");
+                }
               } catch {
-                setResults(SAMPLE_VIDEOS);
-                setApiToast("⚠ Using local data");
+                const videos = await apiTrending("BD", 20).catch(() => SAMPLE_VIDEOS);
+                setResults(videos.length ? videos : SAMPLE_VIDEOS);
+                setPlaylist(videos.length ? videos : SAMPLE_VIDEOS);
+                setApiToast(tok ? "⚠ Using trending — subscription unavailable" : "⚠ Using local data");
                 setTimeout(() => setApiToast(""), 2500);
               }
             }} style={{
@@ -2070,6 +2297,123 @@ function FloatTubeApp() {
         {/* ══ HOME / SEARCH / HISTORY / FAV / RECOMMENDED ══ */}
         {tab !== "playlists" && (
           <>
+
+            {/* ── SUBSCRIPTIONS TAB: Channel strip + "Not logged in" prompt ── */}
+            {tab === "recommended" && (
+              <div>
+                {/* Not logged in prompt */}
+                {!googleAccount?.accessToken && (
+                  <div style={{
+                    display: "flex", flexDirection: "column", alignItems: "center",
+                    padding: "60px 24px", gap: 16, textAlign: "center",
+                  }}>
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="#333">
+                      <path d="M20 8H4V6h16zm-2-6H6v2h12zm4 10v8a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2m-6 4l-6-3.27v6.53z"/>
+                    </svg>
+                    <div style={{ color: "#f1f1f1", fontSize: 18, fontWeight: 700 }}>সাবস্ক্রিপশন দেখতে সাইন ইন করুন</div>
+                    <div style={{ color: "#aaa", fontSize: 13, lineHeight: 1.6 }}>
+                      আপনার Google অ্যাকাউন্ট দিয়ে সাইন ইন করলে<br/>
+                      সাবস্ক্রাইব করা চ্যানেলের নতুন ভিডিও দেখতে পাবেন।
+                    </div>
+                    <button onClick={() => setShowProfilePage(true)} style={{
+                      background: "#3ea6ff", border: "none", borderRadius: 20,
+                      padding: "12px 28px", color: "#0f0f0f",
+                      fontSize: 14, fontWeight: 700, cursor: "pointer",
+                    }}>Sign In</button>
+                  </div>
+                )}
+
+                {/* Loading skeleton */}
+                {googleAccount?.accessToken && subFeedLoading && (
+                  <div>
+                    <div style={{ display: "flex", gap: 12, padding: "14px 14px 10px", overflowX: "auto" }}>
+                      {[1,2,3,4,5].map(i => (
+                        <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6, flexShrink: 0 }}>
+                          <div className="shimmer-bg" style={{ width: 52, height: 52, borderRadius: "50%" }} />
+                          <div className="shimmer-bg" style={{ width: 46, height: 9, borderRadius: 4 }} />
+                        </div>
+                      ))}
+                    </div>
+                    {[1,2,3].map(i => (
+                      <div key={i} style={{ display: "flex", gap: 12, padding: "10px 14px" }}>
+                        <div className="shimmer-bg" style={{ width: 120, height: 68, borderRadius: 8, flexShrink: 0 }} />
+                        <div style={{ flex: 1 }}>
+                          <div className="shimmer-bg" style={{ height: 13, borderRadius: 4, marginBottom: 6 }} />
+                          <div className="shimmer-bg" style={{ height: 11, borderRadius: 4, width: "65%", marginBottom: 5 }} />
+                          <div className="shimmer-bg" style={{ height: 10, borderRadius: 4, width: "40%" }} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Channel avatar strip */}
+                {googleAccount?.accessToken && !subFeedLoading && subChannels.length > 0 && (
+                  <div style={{
+                    display: "flex", gap: 16, padding: "14px 14px 10px",
+                    overflowX: "auto", borderBottom: "1px solid #1a1a1a",
+                    msOverflowStyle: "none", scrollbarWidth: "none",
+                  }}>
+                    {subChannels.map(ch => (
+                      <div key={ch.id} style={{
+                        display: "flex", flexDirection: "column", alignItems: "center",
+                        gap: 5, flexShrink: 0, cursor: "pointer",
+                      }}>
+                        {ch.thumb ? (
+                          <img src={ch.thumb} alt={ch.name}
+                            style={{ width: 52, height: 52, borderRadius: "50%", objectFit: "cover",
+                              border: "2px solid #272727" }} />
+                        ) : (
+                          <div style={{ width: 52, height: 52, borderRadius: "50%",
+                            background: "#2a2a2a", display: "flex", alignItems: "center",
+                            justifyContent: "center", fontSize: 18, color: "#aaa", fontWeight: 700 }}>
+                            {ch.name?.[0]?.toUpperCase() || "C"}
+                          </div>
+                        )}
+                        <span style={{
+                          color: "#aaa", fontSize: 10, maxWidth: 60,
+                          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                          textAlign: "center",
+                        }}>{ch.name}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* "Today" / "This week" grouping header */}
+                {googleAccount?.accessToken && !subFeedLoading && subFeedVideos.length > 0 && (
+                  <div style={{
+                    padding: "12px 14px 6px",
+                    color: "#f1f1f1", fontSize: 14, fontWeight: 700,
+                  }}>সাম্প্রতিক ভিডিও</div>
+                )}
+
+                {/* Empty state for logged-in but no subs */}
+                {googleAccount?.accessToken && !subFeedLoading && subChannels.length === 0 && (
+                  <div style={{
+                    display: "flex", flexDirection: "column", alignItems: "center",
+                    padding: "60px 24px", gap: 12, textAlign: "center",
+                  }}>
+                    <div style={{ fontSize: 48 }}>📺</div>
+                    <div style={{ color: "#f1f1f1", fontSize: 16, fontWeight: 600 }}>কোনো সাবস্ক্রিপশন নেই</div>
+                    <div style={{ color: "#aaa", fontSize: 13, lineHeight: 1.6 }}>
+                      YouTube-এ চ্যানেল সাবস্ক্রাইব করলে<br/>এখানে দেখা যাবে।
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── HOME: "Personalized for you" label when logged in ── */}
+            {tab === "home" && googleAccount?.accessToken && personalizedFeed.length > 0 && (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 8,
+                padding: "10px 14px 4px",
+              }}>
+                <span style={{ fontSize: 13, color: "#aaa" }}>🎯 আপনার জন্য</span>
+              </div>
+            )}
+
             {/* ── Featured Banner (first video, large card) ── */}
             {tab === "home" && featuredVideo && (
               <div
@@ -2380,8 +2724,17 @@ function FloatTubeApp() {
                       display: "flex", alignItems: "center", gap: 3,
                     }}>🔒 YT only</div>
                   )}
+                  {/* Subscription badge */}
+                  {video._fromSub && (
+                    <div style={{
+                      position: "absolute", top: 8, left: 8,
+                      background: "#ff000099", borderRadius: 4,
+                      padding: "2px 7px", fontSize: 9, fontWeight: 700, color: "#fff",
+                      display: "flex", alignItems: "center", gap: 3,
+                    }}>📺 Subscribed</div>
+                  )}
                   {/* Recommendation badge */}
-                  {tab === "recommended" && video.score > 0 && (
+                  {tab === "recommended" && video.score > 0 && !video._fromSub && (
                     <div style={{
                       position: "absolute", bottom: 8, left: 8,
                       background: "#ff000099", borderRadius: 4,
@@ -2769,9 +3122,14 @@ function FloatTubeApp() {
                             avatar: userInfo.picture || "",
                             accessToken: token,
                           });
-                          setApiToast(`✅ Signed in as ${userInfo.name || userInfo.email}`);
-                          setTimeout(() => setApiToast(""), 3000);
+                          setApiToast(`✅ Signed in as ${userInfo.name || userInfo.email} — loading your feed...`);
                           setShowProfilePage(false);
+                          // Immediately start loading personalized feed
+                          setPersonalizedFeed([]);
+                          setSubFeedVideos([]);
+                          setSubFeedLoaded(false);
+                          setResults([]);
+                          setTimeout(() => setApiToast(""), 4000);
                         } catch(e) {
                           setApiToast("⚠ Could not get profile info");
                           setTimeout(() => setApiToast(""), 3000);
@@ -3139,7 +3497,7 @@ function FloatTubeApp() {
                 onMinimize={() => setMinimized(true)}
                 onNext={handleNext}
                 onPrev={handlePrev}
-                onEnded={() => { if (autoPlay) handleNext(); }}
+                onEnded={handleNext}
                 isFav={isFav(currentVideo.id)}
                 onToggleFav={toggleFav}
                 onAddToPlaylist={(v) => setAddToPlaylistVideo(v)}
@@ -3148,6 +3506,8 @@ function FloatTubeApp() {
                 playVideo={playVideo}
                 addToQueue={addToQueue}
                 isQueued={isQueued}
+                autoPlay={autoPlay}
+                setAutoPlay={setAutoPlay}
               />
             </div>
           )}
@@ -3289,7 +3649,7 @@ const SAMPLE_COMMENTS = [
 //  Video + Controls + Info + Description + Like/Dislike
 //  Subscribe + Action Chips + Comments + Related Videos
 // ══════════════════════════════════════════════════════════
-function YouTubeInlinePlayer({ video, onClose, onMinimize, onNext, onPrev, onEnded, isFav, onToggleFav, onAddToPlaylist, playlist, currentVideo, playVideo, addToQueue, isQueued }) {
+function YouTubeInlinePlayer({ video, onClose, onMinimize, onNext, onPrev, onEnded, isFav, onToggleFav, onAddToPlaylist, playlist, currentVideo, playVideo, addToQueue, isQueued, autoPlay = true, setAutoPlay }) {
 
   // ── Player refs ──
   const playerDivRef = useRef(null);
@@ -3402,7 +3762,7 @@ function YouTubeInlinePlayer({ video, onClose, onMinimize, onNext, onPrev, onEnd
           onStateChange: (e) => {
             if (e.data === YT.PlayerState.PLAYING) { setPlaying(true);  startTick(); }
             if (e.data === YT.PlayerState.PAUSED)  { setPlaying(false); stopTick();  }
-            if (e.data === YT.PlayerState.ENDED)   { stopTick(); onEnded?.(); }
+            if (e.data === YT.PlayerState.ENDED)   { stopTick(); if (autoPlay) onEnded?.(); }
           },
           onError: (e) => {
             const msgs = {
@@ -3416,10 +3776,7 @@ function YouTubeInlinePlayer({ video, onClose, onMinimize, onNext, onPrev, onEnd
             setToast(`⚠ ${msg}`);
             if (e.data === 101 || e.data === 150 || e.data === 100) {
               setEmbedError({ code: e.data, msg });
-              // Auto-skip to next video after 3 seconds if autoplay is on
-              if (e.data === 101 || e.data === 150) {
-                setTimeout(() => onNext?.(), 3000);
-              }
+              // Auto-skip disabled — user manually skips or watches on YouTube
             }
             setPlaying(false);
           },
@@ -4247,10 +4604,10 @@ function YouTubeInlinePlayer({ video, onClose, onMinimize, onNext, onPrev, onEnd
             <span style={{ color: "#f1f1f1", fontSize: 14, fontWeight: 600 }}>
               Up Next {relatedLoading && <span style={{ color: "#717171", fontSize: 12, fontWeight: 400 }}>Loading...</span>}
             </span>
-            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+            <label onClick={() => setAutoPlay && setAutoPlay(p => !p)} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
               <span style={{ color: "#aaa", fontSize: 12 }}>Autoplay</span>
-              <div style={{ width: 34, height: 20, borderRadius: 10, background: "#3ea6ff", position: "relative" }}>
-                <div style={{ position: "absolute", right: 2, top: 2, width: 16, height: 16, background: "#fff", borderRadius: "50%" }} />
+              <div style={{ width: 34, height: 20, borderRadius: 10, background: autoPlay ? "#3ea6ff" : "#717171", position: "relative", transition: "background 0.2s" }}>
+                <div style={{ position: "absolute", top: 2, width: 16, height: 16, background: "#fff", borderRadius: "50%", transition: "left 0.2s, right 0.2s", ...(autoPlay ? { right: 2 } : { left: 2 }) }} />
               </div>
             </label>
           </div>
