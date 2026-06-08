@@ -83,6 +83,7 @@ function ytItemToVideo(item) {
     publishedAt:  snippet.publishedAt  || "",
     description:  snippet.description  || "",
     duration:     item.contentDetails?.duration || "",
+    embeddable:   item.status?.embeddable !== false,
     _real: true,  // flag: real API data
   };
 }
@@ -139,62 +140,78 @@ async function ytFetch(endpoint, params = {}) {
 
 // Search videos
 async function apiSearch(q, maxResults = 20, pageToken = "") {
+  // Fetch extra results to compensate for filtering
+  const fetchCount = Math.min(maxResults * 2, 50);
   const data = await ytFetch("search", {
     part: "snippet", q, type: "video",
-    videoEmbeddable: "true",   // only embeddable results
-    videoSyndicated: "true",
-    maxResults,
+    maxResults: fetchCount,
     ...(pageToken ? { pageToken } : {}),
   });
   const ids = data.items.map(i => i.id.videoId).filter(Boolean).join(",");
   if (!ids) return { videos: [], nextPageToken: null };
-  const details = await ytFetch("videos", { part: "snippet,statistics,contentDetails", id: ids });
-  const videos = details.items.map(ytItemToVideo);
+  // Fetch status to check embeddable field
+  const details = await ytFetch("videos", {
+    part: "snippet,statistics,contentDetails,status", id: ids,
+  });
+  // Filter: only embeddable videos
+  const videos = details.items
+    .filter(item => item.status?.embeddable !== false)
+    .slice(0, maxResults)
+    .map(ytItemToVideo);
   return { videos, nextPageToken: data.nextPageToken || null };
 }
 
 // Get trending / popular videos (home feed)
 async function apiTrending(regionCode = "BD", maxResults = 20) {
-  // mostPopular often returns embed-disabled videos (dramas, trailers).
-  // Use search API with videoEmbeddable=true to guarantee playable videos.
+  // Fetch with status part to check embeddable field
+  const tryFetch = async (params) => {
+    const data = await ytFetch("videos", {
+      part: "snippet,statistics,contentDetails,status",
+      ...params,
+    });
+    // Filter to only embeddable videos
+    return data.items.filter(item => item.status?.embeddable !== false).map(ytItemToVideo);
+  };
+
   try {
+    // Try BD music search first (more embed-friendly than mostPopular)
     const searchData = await ytFetch("search", {
-      part: "snippet",
-      type: "video",
-      videoEmbeddable: "true",       // ✅ only embeddable videos
-      videoSyndicated: "true",       // ✅ can play outside YouTube
-      videoCategoryId: "10",         // Music — most embed-friendly
-      regionCode,
-      maxResults,
+      part: "snippet", type: "video",
+      q: "music video official",
+      videoCategoryId: "10",
+      regionCode, maxResults: 40,
       order: "viewCount",
-      relevanceLanguage: "bn",       // Bangla preference
     });
     const ids = searchData.items.map(i => i.id.videoId).filter(Boolean).join(",");
     if (!ids) throw new Error("no ids");
     const details = await ytFetch("videos", {
-      part: "snippet,statistics,contentDetails",
-      id: ids,
+      part: "snippet,statistics,contentDetails,status", id: ids,
     });
-    return details.items.map(ytItemToVideo);
+    const embeddable = details.items
+      .filter(item => item.status?.embeddable !== false)
+      .slice(0, maxResults)
+      .map(ytItemToVideo);
+    if (embeddable.length >= 5) return embeddable;
+    throw new Error("not enough");
   } catch {
-    // Fallback — global popular music, embeddable
     try {
+      // Fallback — global popular music
       const searchData = await ytFetch("search", {
-        part: "snippet",
-        type: "video",
-        videoEmbeddable: "true",
-        videoSyndicated: "true",
+        part: "snippet", type: "video",
+        q: "official music video 2024",
         videoCategoryId: "10",
-        maxResults,
+        maxResults: 40,
         order: "viewCount",
       });
       const ids = searchData.items.map(i => i.id.videoId).filter(Boolean).join(",");
-      if (!ids) throw new Error("no ids");
+      if (!ids) return [];
       const details = await ytFetch("videos", {
-        part: "snippet,statistics,contentDetails",
-        id: ids,
+        part: "snippet,statistics,contentDetails,status", id: ids,
       });
-      return details.items.map(ytItemToVideo);
+      return details.items
+        .filter(item => item.status?.embeddable !== false)
+        .slice(0, maxResults)
+        .map(ytItemToVideo);
     } catch {
       return [];
     }
@@ -1526,31 +1543,28 @@ function FloatTubeApp() {
     setShowFindMusic(true);
     setMusicSearching(true);
     try {
-      // Use search with embeddable filter — mostPopular music often embed-disabled
       const searchData = await ytFetch("search", {
-        part: "snippet",
-        type: "video",
-        videoEmbeddable: "true",
-        videoSyndicated: "true",
+        part: "snippet", type: "video",
+        q: "music video official 2024",
         videoCategoryId: "10",
-        maxResults: 20,
+        maxResults: 40,
         order: "viewCount",
       });
       const ids = searchData.items.map(i => i.id.videoId).filter(Boolean).join(",");
       if (ids) {
         const details = await ytFetch("videos", {
-          part: "snippet,statistics,contentDetails", id: ids,
+          part: "snippet,statistics,contentDetails,status", id: ids,
         });
-        const videos = details.items.map(ytItemToVideo);
+        const videos = details.items
+          .filter(item => item.status?.embeddable !== false)
+          .slice(0, 20)
+          .map(ytItemToVideo);
         setMusicResults(videos.length ? videos : SAMPLE_VIDEOS);
       } else {
         setMusicResults(SAMPLE_VIDEOS);
       }
     } catch {
-      const allMusic = SAMPLE_VIDEOS.filter(v =>
-        MUSIC_KEYWORDS.some(kw => v.title.toLowerCase().includes(kw))
-      );
-      setMusicResults(allMusic.length ? allMusic : SAMPLE_VIDEOS);
+      setMusicResults(SAMPLE_VIDEOS);
     }
     setMusicSearching(false);
   };
@@ -2196,6 +2210,15 @@ function FloatTubeApp() {
                           <span style={{ color: "#fff", fontSize: 28 }}>▶</span>
                         </div>
                       )}
+                      {/* Embed-disabled badge */}
+                      {video.embeddable === false && (
+                        <div style={{
+                          position: "absolute", bottom: 6, left: 6,
+                          background: "#000000bb", borderRadius: 4,
+                          padding: "2px 6px", fontSize: 10, color: "#ffcc00",
+                          display: "flex", alignItems: "center", gap: 3,
+                        }}>🔒 YT only</div>
+                      )}
                     </div>
                     {/* Title below thumb */}
                     <div style={{ padding: "6px 8px 10px" }}>
@@ -2347,6 +2370,15 @@ function FloatTubeApp() {
                         <span style={{ color: "#fff", fontSize: 20, marginLeft: 2 }}>▶</span>
                       </div>
                     </div>
+                  )}
+                  {/* Embed-disabled badge */}
+                  {video.embeddable === false && (
+                    <div style={{
+                      position: "absolute", bottom: 6, left: 6,
+                      background: "#000000bb", borderRadius: 4,
+                      padding: "2px 6px", fontSize: 10, color: "#ffcc00",
+                      display: "flex", alignItems: "center", gap: 3,
+                    }}>🔒 YT only</div>
                   )}
                   {/* Recommendation badge */}
                   {tab === "recommended" && video.score > 0 && (
@@ -3384,6 +3416,10 @@ function YouTubeInlinePlayer({ video, onClose, onMinimize, onNext, onPrev, onEnd
             setToast(`⚠ ${msg}`);
             if (e.data === 101 || e.data === 150 || e.data === 100) {
               setEmbedError({ code: e.data, msg });
+              // Auto-skip to next video after 3 seconds if autoplay is on
+              if (e.data === 101 || e.data === 150) {
+                setTimeout(() => onNext?.(), 3000);
+              }
             }
             setPlaying(false);
           },
