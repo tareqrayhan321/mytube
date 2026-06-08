@@ -140,12 +140,14 @@ async function ytFetch(endpoint, params = {}) {
 // Search videos
 async function apiSearch(q, maxResults = 20, pageToken = "") {
   const data = await ytFetch("search", {
-    part: "snippet", q, type: "video", maxResults,
+    part: "snippet", q, type: "video",
+    videoEmbeddable: "true",   // only embeddable results
+    videoSyndicated: "true",
+    maxResults,
     ...(pageToken ? { pageToken } : {}),
   });
   const ids = data.items.map(i => i.id.videoId).filter(Boolean).join(",");
   if (!ids) return { videos: [], nextPageToken: null };
-  // Fetch full stats + contentDetails
   const details = await ytFetch("videos", { part: "snippet,statistics,contentDetails", id: ids });
   const videos = details.items.map(ytItemToVideo);
   return { videos, nextPageToken: data.nextPageToken || null };
@@ -153,22 +155,49 @@ async function apiSearch(q, maxResults = 20, pageToken = "") {
 
 // Get trending / popular videos (home feed)
 async function apiTrending(regionCode = "BD", maxResults = 20) {
+  // mostPopular often returns embed-disabled videos (dramas, trailers).
+  // Use search API with videoEmbeddable=true to guarantee playable videos.
   try {
-    const data = await ytFetch("videos", {
-      part: "snippet,statistics,contentDetails",
-      chart: "mostPopular",
-      regionCode, maxResults,
-    });
-    return data.items.map(ytItemToVideo);
-  } catch {
-    // Fallback to music category
-    const data = await ytFetch("videos", {
-      part: "snippet,statistics,contentDetails",
-      chart: "mostPopular",
-      videoCategoryId: "10", // Music
+    const searchData = await ytFetch("search", {
+      part: "snippet",
+      type: "video",
+      videoEmbeddable: "true",       // ✅ only embeddable videos
+      videoSyndicated: "true",       // ✅ can play outside YouTube
+      videoCategoryId: "10",         // Music — most embed-friendly
+      regionCode,
       maxResults,
+      order: "viewCount",
+      relevanceLanguage: "bn",       // Bangla preference
     });
-    return data.items.map(ytItemToVideo);
+    const ids = searchData.items.map(i => i.id.videoId).filter(Boolean).join(",");
+    if (!ids) throw new Error("no ids");
+    const details = await ytFetch("videos", {
+      part: "snippet,statistics,contentDetails",
+      id: ids,
+    });
+    return details.items.map(ytItemToVideo);
+  } catch {
+    // Fallback — global popular music, embeddable
+    try {
+      const searchData = await ytFetch("search", {
+        part: "snippet",
+        type: "video",
+        videoEmbeddable: "true",
+        videoSyndicated: "true",
+        videoCategoryId: "10",
+        maxResults,
+        order: "viewCount",
+      });
+      const ids = searchData.items.map(i => i.id.videoId).filter(Boolean).join(",");
+      if (!ids) throw new Error("no ids");
+      const details = await ytFetch("videos", {
+        part: "snippet,statistics,contentDetails",
+        id: ids,
+      });
+      return details.items.map(ytItemToVideo);
+    } catch {
+      return [];
+    }
   }
 }
 
@@ -239,7 +268,6 @@ function googleSignIn(callback) {
         scope: [
           "https://www.googleapis.com/auth/userinfo.profile",
           "https://www.googleapis.com/auth/userinfo.email",
-          "https://www.googleapis.com/auth/youtube.readonly",
         ].join(" "),
         callback: (response) => {
           if (response.error) {
@@ -1498,14 +1526,26 @@ function FloatTubeApp() {
     setShowFindMusic(true);
     setMusicSearching(true);
     try {
-      const data = await ytFetch("videos", {
-        part: "snippet,statistics,contentDetails",
-        chart: "mostPopular",
-        videoCategoryId: "10", // Music category
+      // Use search with embeddable filter — mostPopular music often embed-disabled
+      const searchData = await ytFetch("search", {
+        part: "snippet",
+        type: "video",
+        videoEmbeddable: "true",
+        videoSyndicated: "true",
+        videoCategoryId: "10",
         maxResults: 20,
+        order: "viewCount",
       });
-      const videos = data.items.map(ytItemToVideo);
-      setMusicResults(videos.length ? videos : SAMPLE_VIDEOS);
+      const ids = searchData.items.map(i => i.id.videoId).filter(Boolean).join(",");
+      if (ids) {
+        const details = await ytFetch("videos", {
+          part: "snippet,statistics,contentDetails", id: ids,
+        });
+        const videos = details.items.map(ytItemToVideo);
+        setMusicResults(videos.length ? videos : SAMPLE_VIDEOS);
+      } else {
+        setMusicResults(SAMPLE_VIDEOS);
+      }
     } catch {
       const allMusic = SAMPLE_VIDEOS.filter(v =>
         MUSIC_KEYWORDS.some(kw => v.title.toLowerCase().includes(kw))
@@ -3573,31 +3613,43 @@ function YouTubeInlinePlayer({ video, onClose, onMinimize, onNext, onPrev, onEnd
             position: "absolute", inset: 0, background: "#0f0f0f",
             display: "flex", flexDirection: "column",
             alignItems: "center", justifyContent: "center",
-            gap: 14, padding: 20, zIndex: 20,
+            gap: 12, padding: 20, zIndex: 20,
           }}>
             <img src={video.thumb} alt=""
               style={{ width: "80%", maxWidth: 260, borderRadius: 10, objectFit: "cover", opacity: 0.5 }} />
             <div style={{ textAlign: "center" }}>
-              <div style={{ color: "#fff", fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
-                {embedError.code === 100 ? "🔒 Video unavailable" : "⚠ Embedding disabled"}
+              <div style={{ color: "#ff4444", fontSize: 13, fontWeight: 600, marginBottom: 4 }}>
+                ⚠ {embedError.code === 100 ? "Video unavailable" : "Embedding disabled"}
               </div>
               <div style={{ color: "#aaa", fontSize: 11, lineHeight: 1.5 }}>
                 {embedError.code === 100
                   ? "This video is private or removed."
-                  : "Owner disabled embedding. Open on YouTube."}
+                  : "This video cannot be embedded.\nThe owner has disabled it."}
               </div>
             </div>
-            <a href={`https://www.youtube.com/watch?v=${video.id}`}
-              target="_blank" rel="noopener noreferrer"
-              style={{
-                background: "#ff0000", color: "#fff",
-                borderRadius: 22, padding: "10px 22px",
-                fontSize: 13, fontWeight: 700, textDecoration: "none",
-                display: "flex", alignItems: "center", gap: 7,
-              }}>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="#fff"><path d="M10 15l5.19-3L10 9v6m11.56-7.83c.13.47.22 1.1.28 1.9.07.8.1 1.49.1 2.09L22 12c0 2.19-.16 3.8-.44 4.83-.25.9-.83 1.48-1.73 1.73-.47.13-1.33.22-2.65.28-1.3.07-2.49.1-3.59.1L12 19c-4.19 0-6.8-.16-7.83-.44-.9-.25-1.48-.83-1.73-1.73-.13-.47-.22-1.1-.28-1.9-.07-.8-.1-1.49-.1-2.09L2 12c0-2.19.16-3.8.44-4.83.25-.9.83-1.48 1.73-1.73.47-.13 1.33-.22 2.65-.28 1.3-.07 2.49-.1 3.59-.1L12 5c4.19 0 6.8.16 7.83.44.9.25 1.48.83 1.73 1.73z"/></svg>
-              Watch on YouTube
-            </a>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", justifyContent: "center" }}>
+              <a href={`https://www.youtube.com/watch?v=${video.id}`}
+                target="_blank" rel="noopener noreferrer"
+                style={{
+                  background: "#ff0000", color: "#fff",
+                  borderRadius: 22, padding: "10px 18px",
+                  fontSize: 13, fontWeight: 700, textDecoration: "none",
+                  display: "flex", alignItems: "center", gap: 6,
+                }}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="#fff"><path d="M10 15l5.19-3L10 9v6m11.56-7.83c.13.47.22 1.1.28 1.9.07.8.1 1.49.1 2.09L22 12c0 2.19-.16 3.8-.44 4.83-.25.9-.83 1.48-1.73 1.73-.47.13-1.33.22-2.65.28-1.3.07-2.49.1-3.59.1L12 19c-4.19 0-6.8-.16-7.83-.44-.9-.25-1.48-.83-1.73-1.73-.13-.47-.22-1.1-.28-1.9-.07-.8-.1-1.49-.1-2.09L2 12c0-2.19.16-3.8.44-4.83.25-.9.83-1.48 1.73-1.73.47-.13 1.33-.22 2.65-.28 1.3-.07 2.49-.1 3.59-.1L12 5c4.19 0 6.8.16 7.83.44.9.25 1.48.83 1.73 1.73z"/></svg>
+                Watch on YouTube
+              </a>
+              <button onClick={onNext}
+                style={{
+                  background: "#272727", color: "#f1f1f1",
+                  border: "1px solid #444", borderRadius: 22,
+                  padding: "10px 18px", fontSize: 13, fontWeight: 600,
+                  cursor: "pointer", display: "flex", alignItems: "center", gap: 6,
+                }}>
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="#f1f1f1"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
+                Skip to Next
+              </button>
+            </div>
           </div>
         )}
 
